@@ -87,6 +87,6 @@ func (c *OperatorClient) CheckAndMakeHeal(nacos *nacosgroupv1alpha1.Nacos) {
 	c.CheckClient.CheckNacos(nacos, pods)
 }
 
-func (c *OperatorClient) UpdateStatus(nacos *nacosgroupv1alpha1.Nacos) {
-	c.StatusClient.UpdateStatusRunning(nacos)
+func (c *OperatorClient) UpdateStatus(nacos *nacosgroupv1alpha1.Nacos, previous *nacosgroupv1alpha1.NacosStatus) {
+	c.StatusClient.UpdateStatusRunning(nacos, previous)
 }

@@ -2,8 +2,10 @@ package operator
 
 import (
 	"context"
+	"sort"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -22,76 +24,59 @@ type StatusClient struct {
 }
 
 func NewStatusClient(logger log.Logger, k8sService k8s.Services, client client.Client) *StatusClient {
-	return &StatusClient{
-		client: client,
-		logger: logger,
-	}
+	return &StatusClient{client: client, logger: logger}
 }
 
-// 更新状态
-func (c *StatusClient) UpdateStatusRunning(nacos *nacosgroupv1alpha1.Nacos) {
+func (c *StatusClient) UpdateStatusRunning(nacos *nacosgroupv1alpha1.Nacos, previous *nacosgroupv1alpha1.NacosStatus) {
 	c.updateLastEvent(nacos, 200, "", true)
 	nacos.Status.Phase = nacosgroupv1alpha1.PhaseRunning
-	// TODO
-	myErrors.EnsureNormal(c.client.Status().Update(context.TODO(), nacos))
+	c.UpdateStatus(nacos, previous)
 }
 
-// 更新状态
-func (c *StatusClient) UpdateStatus(nacos *nacosgroupv1alpha1.Nacos) {
-	// TODO
-	myErrors.EnsureNormal(c.client.Status().Update(context.TODO(), nacos))
-}
-
-func (c *StatusClient) UpdateExceptionStatus(nacos *nacosgroupv1alpha1.Nacos, err *myErrors.Err) {
-	c.updateLastEvent(nacos, err.Code, err.Msg, false)
-	// 设置为异常状态
-	nacos.Status.Phase = nacosgroupv1alpha1.PhaseFailed
-	e := c.client.Status().Update(context.TODO(), nacos)
-	if e != nil {
-		c.logger.V(-1).Info(e.Error())
+// Compare against the snapshot taken before reconciliation changed any status fields.
+func (c *StatusClient) UpdateStatus(nacos *nacosgroupv1alpha1.Nacos, previous *nacosgroupv1alpha1.NacosStatus) {
+	sort.SliceStable(nacos.Status.Conditions, func(i, j int) bool {
+		return nacos.Status.Conditions[i].PodName < nacos.Status.Conditions[j].PodName
+	})
+	if equality.Semantic.DeepEqual(previous, &nacos.Status) {
+		return
 	}
+	myErrors.EnsureNormal(c.client.Status().Update(context.TODO(), nacos))
+}
 
+func (c *StatusClient) UpdateExceptionStatus(nacos *nacosgroupv1alpha1.Nacos, err *myErrors.Err, previous *nacosgroupv1alpha1.NacosStatus) {
+	c.updateLastEvent(nacos, err.Code, err.Msg, false)
+	nacos.Status.Phase = nacosgroupv1alpha1.PhaseFailed
+	c.UpdateStatus(nacos, previous)
 }
 
 const EVENT_MAX_SIZE = 10
 
 func (c *StatusClient) updateLastEvent(nacos *nacosgroupv1alpha1.Nacos, code int, msg string, status bool) {
-	var event nacosgroupv1alpha1.Event
+	phase := nacosgroupv1alpha1.PhaseFailed
+	if status {
+		phase = nacosgroupv1alpha1.PhaseRunning
+	}
+	now := metav1.NewTime(time.Now())
+	events := nacos.Status.Event
+	if len(events) > 0 {
+		last := &events[len(events)-1]
+		if nacos.Status.Phase == phase && last.Code == code && last.Message == msg && last.Status == status {
+			return
+		}
+		// Keep the existing history model: the same error code updates its latest event.
+		if last.Code == code {
+			last.Message = msg
+			last.Status = status
+			last.LastTransitionTime = now
+			return
+		}
+	}
+	nacos.Status.Event = append(events, nacosgroupv1alpha1.Event{
+		Code: code, Status: status, Message: msg,
+		FirstAppearTime: now, LastTransitionTime: now,
+	})
 	if len(nacos.Status.Event) > EVENT_MAX_SIZE {
-		nacos.Status.Event = append(nacos.Status.Event[:0], nacos.Status.Event[1:]...)
-
+		nacos.Status.Event = nacos.Status.Event[len(nacos.Status.Event)-EVENT_MAX_SIZE:]
 	}
-	if len(nacos.Status.Event) == 0 {
-		event = nacosgroupv1alpha1.Event{
-			Code: code,
-			FirstAppearTime: metav1.Time{
-				Time: time.Now()},
-			Message: msg,
-		}
-		nacos.Status.Event = append(nacos.Status.Event, event)
-	} else {
-		// 获取最近的event
-		event = nacos.Status.Event[len(nacos.Status.Event)-1]
-	}
-
-	// 如果是已经存在的，就更新时间
-	if event.Code == code {
-		event.LastTransitionTime.Time = time.Now()
-		event.Message = msg
-		nacos.Status.Event[len(nacos.Status.Event)-1] = event
-	} else {
-		event = nacosgroupv1alpha1.Event{
-			Code:    code,
-			Status:  status,
-			Message: msg,
-			LastTransitionTime: metav1.Time{
-				Time: time.Now(),
-			},
-			FirstAppearTime: metav1.Time{
-				Time: time.Now(),
-			},
-		}
-		nacos.Status.Event = append(nacos.Status.Event, event)
-	}
-
 }

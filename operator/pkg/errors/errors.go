@@ -40,9 +40,9 @@ func EnsureNormalMsgf(err error, format string, a ...interface{}) {
 }
 
 func New(code int, format string, a ...interface{}) *Err {
-	msg := fmt.Sprintf(format, a...)
-	if len(a) == 0 {
-		msg = fmt.Sprint(format, a)
+	msg := format
+	if len(a) > 0 {
+		msg = fmt.Sprintf(format, a...)
 	}
 	return &Err{
 		Code: code,
@@ -64,9 +64,9 @@ func NewErrMsg(err string) *Err {
 }
 
 func NewErrfMsgf(format string, a ...interface{}) *Err {
-	msg := fmt.Sprintf(format, a...)
-	if len(a) == 0 {
-		msg = fmt.Sprint(format, a)
+	msg := format
+	if len(a) > 0 {
+		msg = fmt.Sprintf(format, a...)
 	}
 	return &Err{
 		Code: CODE_ERR_UNKNOW,

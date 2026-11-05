@@ -18,7 +18,7 @@ package controllers
 
 import (
 	"context"
-	"reflect"
+	"fmt"
 	"time"
 
 	"nacos.io/nacos-operator/pkg/service/operator"
@@ -28,7 +28,9 @@ import (
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	nacosgroupv1alpha1 "nacos.io/nacos-operator/api/v1alpha1"
@@ -58,24 +60,26 @@ func (r *NacosReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		if k8sErrors.IsNotFound(err) {
 			return reconcile.Result{}, nil
 		}
-		return reconcile.Result{}, err
+		r.Log.Error(err, "Unable to read Nacos resource")
+		return reconcile.Result{RequeueAfter: time.Second * 5}, nil
 	}
 
-	// 工作逻辑入口 , 引发了painc，返回默认false，重新插入队列,5秒继续执行
-	result := r.ReconcileWork(instance)
+	// Capture all status fields before any reconciliation stage changes them.
+	previous := instance.Status.DeepCopy()
+	result := r.ReconcileWork(instance, previous)
 	if result == false {
 		return reconcile.Result{RequeueAfter: time.Second * 5}, nil
 	} else {
-		return reconcile.Result{}, nil
+		return reconcile.Result{RequeueAfter: time.Second * 30}, nil
 	}
 
 }
 
-func (r *NacosReconciler) ReconcileWork(instance *nacosgroupv1alpha1.Nacos) bool {
+func (r *NacosReconciler) ReconcileWork(instance *nacosgroupv1alpha1.Nacos, previous *nacosgroupv1alpha1.NacosStatus) bool {
 	// 处理全局异常处理中的异常
 	defer func() {
 		if err := recover(); err != nil {
-			r.Log.Error(err.(error), "unknow error")
+			r.Log.Error(reconciliationError(err), "Unable to persist reconciliation status")
 		}
 	}()
 
@@ -83,7 +87,7 @@ func (r *NacosReconciler) ReconcileWork(instance *nacosgroupv1alpha1.Nacos) bool
 	defer func() {
 		if err := recover(); err != nil {
 			// 可处理的异常
-			r.globalExceptHandle(err, instance)
+			r.globalExceptHandle(err, instance, previous)
 		}
 	}()
 
@@ -93,12 +97,11 @@ func (r *NacosReconciler) ReconcileWork(instance *nacosgroupv1alpha1.Nacos) bool
 		r.OperaterClient.MakeEnsure,
 		// 检查并保障
 		r.OperaterClient.CheckAndMakeHeal,
-		// 保存状态
-		r.OperaterClient.UpdateStatus,
 	} {
 		fun(instance)
 	}
 
+	r.OperaterClient.UpdateStatus(instance, previous)
 	return true
 }
 
@@ -113,29 +116,35 @@ func filterByLabel(label map[string]string) bool {
 
 func (r *NacosReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&nacosgroupv1alpha1.Nacos{}).
+		For(&nacosgroupv1alpha1.Nacos{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&appsv1.StatefulSet{}).
 		Complete(r)
 }
 
-// 全局异常处理
-func (r *NacosReconciler) globalExceptHandle(err interface{}, instance *nacosgroupv1alpha1.Nacos) {
-	if reflect.TypeOf(err) == reflect.TypeOf(myErrors.NewErrMsg("")) {
-		myerr := err.(*myErrors.Err)
-		r.Log.V(0).Info("painc", "code", myerr.Code, "msg", myerr.Msg)
-		switch myerr.Code {
-		case myErrors.CODE_NORMAL:
-			r.OperaterClient.StatusClient.UpdateStatus(instance)
-			return
-		}
-
-		// 超时3分钟如果还未成功就显示异常
-		if instance.Status.Phase != nacosgroupv1alpha1.PhaseCreating ||
-			instance.CreationTimestamp.Add(time.Minute*3).Before(time.Now()) {
-			r.OperaterClient.StatusClient.UpdateExceptionStatus(instance, myerr)
-		}
-	} else {
-		// 未知的错误，把堆栈打印出来
-		r.Log.Error(err.(error), "unknow error")
+// Keep custom error codes while handling ordinary API errors through the same retry path.
+func (r *NacosReconciler) globalExceptHandle(err interface{}, instance *nacosgroupv1alpha1.Nacos, previous *nacosgroupv1alpha1.NacosStatus) {
+	myerr, ok := err.(*myErrors.Err)
+	if !ok {
+		failure := reconciliationError(err)
+		r.Log.Error(failure, "Reconciliation failed")
+		myerr = myErrors.NewErr(failure)
+	} else if myerr.Code != myErrors.CODE_NORMAL {
+		r.Log.Info("Reconciliation deferred", "code", myerr.Code, "message", myerr.Msg)
 	}
+	if myerr.Code == myErrors.CODE_NORMAL {
+		r.OperaterClient.StatusClient.UpdateStatus(instance, previous)
+		return
+	}
+	// Retain the existing three-minute grace period while initially creating the cluster.
+	if instance.Status.Phase != nacosgroupv1alpha1.PhaseCreating ||
+		instance.CreationTimestamp.Add(time.Minute*3).Before(time.Now()) {
+		r.OperaterClient.StatusClient.UpdateExceptionStatus(instance, myerr, previous)
+	}
+}
+
+func reconciliationError(value interface{}) error {
+	if err, ok := value.(error); ok {
+		return err
+	}
+	return fmt.Errorf("%v", value)
 }

@@ -1,6 +1,7 @@
 package operator
 
 import (
+	"sort"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -16,16 +17,21 @@ type ICheckClient interface {
 	Check(nacos *nacosgroupv1alpha1.Nacos)
 }
 
+type clusterNodesClient interface {
+	GetClusterNodes(string) (nacosClient.ServersInfo, error)
+}
+
 type CheckClient struct {
 	k8sService  k8s.Services
 	logger      log.Logger
-	nacosClient nacosClient.NacosClient
+	nacosClient clusterNodesClient
 }
 
 func NewCheckClient(logger log.Logger, k8sService k8s.Services) *CheckClient {
 	return &CheckClient{
-		k8sService: k8sService,
-		logger:     logger,
+		k8sService:  k8sService,
+		logger:      logger,
+		nacosClient: nacosClient.NewNacosClient(),
 	}
 }
 
@@ -41,6 +47,7 @@ func (c *CheckClient) CheckKind(nacos *nacosgroupv1alpha1.Nacos) []corev1.Pod {
 
 	// 检查正常的pod数量，根据实际情况。如果单实例，必须要有1个;集群要1/2以上
 	pods, err := c.k8sService.GetStatefulSetReadPod(nacos.Namespace, nacos.Name)
+	myErrors.EnsureNormal(err)
 	if len(pods) < (int(*nacos.Spec.Replicas)+1)/2 {
 		panic(myErrors.New(myErrors.CODE_ERR_UNKNOW, "The number of ready pods is too less"))
 	} else if len(pods) != int(*nacos.Spec.Replicas) {
@@ -60,12 +67,15 @@ func (c *CheckClient) CheckNacos(nacos *nacosgroupv1alpha1.Nacos, pods []corev1.
 		myErrors.EnsureEqual(len(servers.Servers), int(*nacos.Spec.Replicas), myErrors.CODE_CLUSTER_FAILE, "server num is not equal")
 		for _, svc := range servers.Servers {
 			myErrors.EnsureEqual(svc.State, "UP", myErrors.CODE_CLUSTER_FAILE, "node is not up")
+			nodeLeader := strings.TrimSpace(svc.ExtendInfo.RaftMetaData.MetaDataMap.NamingPersistentService.Leader)
+			if nacos.Spec.Type == TYPE_CLUSTER && nodeLeader == "" {
+				panic(myErrors.New(myErrors.CODE_CLUSTER_FAILE, "leader missing"))
+			}
 			if leader != "" {
 				// 确保每个节点leader相同
-				myErrors.EnsureEqual(leader, svc.ExtendInfo.RaftMetaData.MetaDataMap.NamingPersistentService.Leader,
-					myErrors.CODE_CLUSTER_FAILE, "leader not equal")
+				myErrors.EnsureEqual(leader, nodeLeader, myErrors.CODE_CLUSTER_FAILE, "leader not equal")
 			} else {
-				leader = svc.ExtendInfo.RaftMetaData.MetaDataMap.NamingPersistentService.Leader
+				leader = nodeLeader
 			}
 			nacos.Status.Version = svc.ExtendInfo.Version
 		}
@@ -82,7 +92,7 @@ func (c *CheckClient) CheckNacos(nacos *nacosgroupv1alpha1.Nacos, pods []corev1.
 		} else {
 			leaderSplit = strings.Split(leader, ":")
 		}
-		if len(leaderSplit) > 0 {
+		if leader != "" && len(leaderSplit) > 0 {
 			if leaderSplit[0] == pod.Name {
 				condition.Type = "leader"
 			} else {
@@ -91,5 +101,7 @@ func (c *CheckClient) CheckNacos(nacos *nacosgroupv1alpha1.Nacos, pods []corev1.
 		}
 		nacos.Status.Conditions = append(nacos.Status.Conditions, condition)
 	}
-
+	sort.Slice(nacos.Status.Conditions, func(i, j int) bool {
+		return nacos.Status.Conditions[i].PodName < nacos.Status.Conditions[j].PodName
+	})
 }
